@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>雲端同步單字本</title>
+  <style>
+    body{margin:0;background:#f6f7fb;font-family:system-ui,-apple-system,"Segoe UI","Noto Sans TC",sans-serif;color:#111}
+    .wrap{max-width:920px;margin:0 auto;padding:18px}
+    .card{background:#fff;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.06);padding:16px;margin-bottom:14px}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    input,button{border-radius:12px;border:1px solid #d9dce6;padding:10px 12px;font-size:14px}
+    input{flex:1;min-width:220px}
+    button{cursor:pointer;border:0;background:#111;color:#fff}
+    button.secondary{background:#eef0f6;color:#111;border:1px solid #d9dce6}
+    .muted{color:#666;font-size:12px}
+    .item{border:1px solid #e7e9f2;border-radius:14px;padding:12px;margin-top:10px}
+    .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:baseline}
+    .word{font-size:18px;font-weight:700}
+    .meta{font-size:12px;color:#555}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <div style="font-size:18px;font-weight:700;">雲端同步單字本（Firebase）</div>
+        <div class="muted" id="status">尚未登入</div>
+      </div>
+
+      <div class="row" style="margin-top:12px;">
+        <button id="login">Google 登入</button>
+        <button id="logout" class="secondary" style="display:none;">登出</button>
+      </div>
+
+      <div class="muted" style="margin-top:10px;">
+        資料會存到 Firestore：users/{uid}/vocab/{word}
+      </div>
+    </div>
+
+    <div class="card" id="main" style="display:none;">
+      <div class="row">
+        <input id="word" placeholder="輸入英文單字，例如: accountable" autocomplete="off" />
+        <button id="add">加入 / +1 次</button>
+      </div>
+      <div class="muted" style="margin-top:8px;">
+        會自動記錄：createdAt、lastSeen、count，並雲端同步。
+      </div>
+      <div id="list"></div>
+    </div>
+  </div>
+
+  <!-- Firebase v9 compat（可用 CDN，免打包工具） -->
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js"></script>
+
+  <script>
+    // 1) 把這段換成你 Firebase Console 的 Web App config
+    const firebaseConfig = {
+      // apiKey: "...",
+      // authDomain: "...",
+      // projectId: "...",
+      // storageBucket: "...",
+      // messagingSenderId: "...",
+      // appId: "..."
+    };
+
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+    const db = firebase.firestore();
+
+    const els = {
+      status: document.getElementById("status"),
+      login: document.getElementById("login"),
+      logout: document.getElementById("logout"),
+      main: document.getElementById("main"),
+      word: document.getElementById("word"),
+      add: document.getElementById("add"),
+      list: document.getElementById("list"),
+    };
+
+    let currentUid = null;
+    let unsub = null;
+
+    function normWord(w){ return (w || "").trim().toLowerCase(); }
+    function fmt(ts){
+      if(!ts) return "";
+      const d = ts.toDate ? ts.toDate() : new Date(ts);
+      return d.toLocaleString("zh-TW", { hour12:false });
+    }
+
+    function renderItems(items){
+      if(!items.length){
+        els.list.innerHTML = `<p class="muted">目前沒有單字</p>`;
+        return;
+      }
+      els.list.innerHTML = items.map(it => `
+        <div class="item">
+          <div class="top">
+            <div class="word">${it.word}</div>
+            <div class="meta">count: <b>${it.count || 0}</b></div>
+          </div>
+          <div class="meta">createdAt: ${fmt(it.createdAt)}</div>
+          <div class="meta">lastSeen: ${fmt(it.lastSeen)}</div>
+        </div>
+      `).join("");
+    }
+
+    async function upsertWord(word){
+      const w = normWord(word);
+      if(!w || !currentUid) return;
+
+      const ref = db.collection("users").doc(currentUid).collection("vocab").doc(w);
+
+      // createdAt 要「只在第一次」寫入：用 transaction 檢查是否存在
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        if(!snap.exists){
+          tx.set(ref, {
+            word: w,
+            count: 1,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+            lastSeen: firebase.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true });
+        }else{
+          tx.set(ref, {
+            word: w,
+            count: firebase.firestore.FieldValue.increment(1),
+            lastSeen: firebase.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true });
+        }
+      });
+    }
+
+    function startSync(uid){
+      const q = db.collection("users").doc(uid).collection("vocab").orderBy("lastSeen", "desc");
+      unsub = q.onSnapshot((snap) => {
+        const items = snap.docs.map(d => d.data());
+        renderItems(items);
+      });
+    }
+
+    function stopSync(){
+      if(unsub) unsub();
+      unsub = null;
+      els.list.innerHTML = "";
+    }
+
+    els.login.onclick = async () => {
+      const provider = new firebase.auth.GoogleAuthProvider();
+      await auth.signInWithPopup(provider);
+    };
+
+    els.logout.onclick = async () => {
+      await auth.signOut();
+    };
+
+    els.add.onclick = async () => {
+      try{
+        await upsertWord(els.word.value);
+        els.word.value = "";
+        els.word.focus();
+      }catch(e){
+        alert(e?.message || "寫入失敗");
+      }
+    };
+
+    els.word.addEventListener("keydown", (e) => {
+      if(e.key === "Enter") els.add.click();
+    });
+
+    auth.onAuthStateChanged((user) => {
+      stopSync();
+
+      if(!user){
+        currentUid = null;
+        els.status.textContent = "尚未登入";
+        els.main.style.display = "none";
+        els.logout.style.display = "none";
+        return;
+      }
+
+      currentUid = user.uid;
+      els.status.textContent = `已登入：${user.email || user.displayName || user.uid}`;
+      els.main.style.display = "";
+      els.logout.style.display = "";
+      startSync(user.uid);
+    });
+  </script>
+</body>
+</html>
